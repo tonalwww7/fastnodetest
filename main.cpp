@@ -1,3 +1,4 @@
+
 // main.cpp
 
 #include <boost/beast/core.hpp>
@@ -11,6 +12,7 @@
 #include <string>
 #include <optional>
 #include <chrono>
+#include <unordered_map>
 
 namespace beast     = boost::beast;
 namespace websocket = beast::websocket;
@@ -30,6 +32,10 @@ static uint64_t nowMs() {
 // Глобальные переменные для состояния
 static std::optional<std::string> sentTxHash; // сюда запомним txHash из eth_sendTransaction
 static uint64_t                     txSendMs = 0; // время (ms) отправки транзакции
+
+// Если до получения ответа на sendTransaction нода уже выдала уведомление с нашим hash,
+// запомним время получения в этот мап
+static std::unordered_map<std::string, uint64_t> prebuffer;
 
 // Асинхронное чтение из WebSocket
 void do_read(
@@ -64,7 +70,7 @@ void do_read(
             }
             auto obj = parsed.as_object();
 
-            // Если это просто ответ на eth_sendTransaction (id == 2) — запомним sentTxHash
+            // 1) Если это ответ на eth_sendTransaction (id == 2), запоминаем sentTxHash
             if (obj.if_contains("id") && obj["id"].is_int64()) {
                 int id = static_cast<int>(obj["id"].as_int64());
                 if (id == 2) {
@@ -72,6 +78,21 @@ void do_read(
                         auto txh = obj["result"].as_string().c_str();
                         sentTxHash = std::string(txh);
                         std::cout << "[INFO] eth_sendTransaction вернул txHash: " << txh << "\n";
+
+                        // Как только узнали sentTxHash, проверяем: 
+                        // возможно, нода уже присылала его до этого – есть в prebuffer?
+                        auto it = prebuffer.find(txh);
+                        if (it != prebuffer.end()) {
+                            uint64_t receiveMs = it->second;
+                            int64_t diff = static_cast<int64_t>(receiveMs) - static_cast<int64_t>(txSendMs);
+                            std::cout << "\n[RESULT] (пропущенный в prebuffer)\n";
+                            std::cout << "  txHash       = " << txh << "\n";
+                            std::cout << "  txSendMs     = " << txSendMs << " ms\n";
+                            std::cout << "  nowReceiveMs = " << receiveMs    << " ms\n";
+                            std::cout << "  Задержка    = " << diff           << " ms\n\n";
+                            std::cout << "[INFO] Завершаем работу.\n";
+                            std::exit(EXIT_SUCCESS);
+                        }
                     }
                     else if (obj.if_contains("error")) {
                         std::cerr << "[ERROR] eth_sendTransaction error: "
@@ -80,33 +101,36 @@ void do_read(
                 }
             }
 
-            // Если это уведомление о newPendingTransactions
+            // 2) Если это уведомление о newPendingTransactions
             if (obj.if_contains("method")
                 && obj["method"].as_string() == "eth_subscription"
                 && obj.if_contains("params"))
             {
                 auto params = obj["params"].as_object();
-                // "result" здесь — это hash новой транзакции
                 if (params.if_contains("result") && params["result"].is_string()) {
                     auto incomingTxHash = params["result"].as_string().c_str();
+                    uint64_t receiveMs = nowMs();
 
-                    // Сразу выведем любой новый приходящий txHash
+                    // Сразу выводим любую новую транзакцию
                     std::cout << "[SUB] incoming txHash: " << incomingTxHash;
-                    if (sentTxHash.has_value() && incomingTxHash == sentTxHash.value()) {
-                        // Если это тот же txHash, который мы отправили, — считаем задержку
-                        uint64_t nowReceiveMs = nowMs();
-                        int64_t diff = static_cast<int64_t>(nowReceiveMs) - static_cast<int64_t>(txSendMs);
 
+                    // Если sentTxHash уже известно и совпало – вычисляем задержку
+                    if (sentTxHash.has_value() && incomingTxHash == sentTxHash.value()) {
+                        int64_t diff = static_cast<int64_t>(receiveMs) - static_cast<int64_t>(txSendMs);
                         std::cout << "  <-- match! Δ = " << diff << " ms\n";
                         std::cout << "\n[RESULT] Нода получила нашу транзакцию в mempool:\n";
-                        std::cout << "         txHash       = " << incomingTxHash << "\n";
-                        std::cout << "         txSendMs     = " << txSendMs << " ms\n";
-                        std::cout << "         nowReceiveMs = " << nowReceiveMs << " ms\n";
-                        std::cout << "         Задержка mempool→нода = " << diff << " ms\n\n";
+                        std::cout << "  txHash       = " << incomingTxHash << "\n";
+                        std::cout << "  txSendMs     = " << txSendMs       << " ms\n";
+                        std::cout << "  nowReceiveMs = " << receiveMs     << " ms\n";
+                        std::cout << "  Задержка    = " << diff           << " ms\n\n";
                         std::cout << "[INFO] Завершаем работу.\n";
                         std::exit(EXIT_SUCCESS);
                     }
                     else {
+                        // Если sentTxHash ещё не пришёл – буферизуем для возможного match позже
+                        if (!sentTxHash.has_value()) {
+                            prebuffer.emplace(std::string(incomingTxHash), receiveMs);
+                        }
                         std::cout << "\n";
                     }
                 }
@@ -121,7 +145,8 @@ int main()
     try {
         const std::string host = "127.0.0.1";
         const std::string port = "8546";
-        std::cout << "[INFO] Подключаемся к Geth-BSC по WS ws://" << host << ":" << port << "\n";
+        std::cout << "[INFO] Подключаемся к Geth-BSC по WS ws://"
+                  << host << ":" << port << "\n";
 
         net::io_context ioc;
         tcp::resolver   resolver{ioc};
@@ -130,7 +155,7 @@ int main()
         auto ws_ptr = std::make_shared<websocket::stream<tcp::socket>>(ioc.get_executor());
         net::connect(ws_ptr->next_layer(), endpoints);
 
-        // Опционально: измеряем WebSocket-RTT
+        // Измеряем WebSocket-RTT (опционально)
         std::chrono::steady_clock::time_point pingSentTime;
         ws_ptr->control_callback(
             [&](websocket::frame_type kind, beast::string_view) {
@@ -145,7 +170,7 @@ int main()
         ws_ptr->handshake(host + ":" + port, "/");
         std::cout << "[INFO] Connected to ws://127.0.0.1:8546\n";
 
-        // Сразу после handshake шлём ping (WebSocket RTT)
+        // Сразу после handshake шлём ping, чтобы измерить RTT
         pingSentTime = std::chrono::steady_clock::now();
         ws_ptr->ping({});
 
@@ -155,7 +180,7 @@ int main()
             subObj["jsonrpc"] = "2.0";
             subObj["id"]      = 1;
             subObj["method"]  = "eth_subscribe";
-            json::array     arr; arr.push_back("newPendingTransactions");
+            json::array arr; arr.push_back("newPendingTransactions");
             subObj["params"] = arr;
 
             ws_ptr->write(net::buffer(boost::json::serialize(subObj)));
@@ -183,7 +208,8 @@ int main()
 
             txSendMs = nowMs();
             ws_ptr->write(net::buffer(boost::json::serialize(sendObj)));
-            std::cout << "[INFO] Отправили eth_sendTransaction, txSendMs = " << txSendMs << " ms\n";
+            std::cout << "[INFO] Отправили eth_sendTransaction, txSendMs = "
+                      << txSendMs << " ms\n";
         }
 
         // Запускаем асинхронное чтение
