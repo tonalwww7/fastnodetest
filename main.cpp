@@ -2,14 +2,9 @@
 
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
-#include <boost/beast/ssl.hpp>
-#include <boost/beast/http.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/ssl/context.hpp>
 #include <boost/json.hpp>
-#include <nlohmann/json.hpp>  // для DEXTools-парсинга
-#include <openssl/ssl.h>      // для SSL_set_tlsext_host_name
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -19,19 +14,16 @@
 #include <mutex>
 #include <chrono>
 
-namespace beast      = boost::beast;
-namespace websocket  = beast::websocket;
-namespace http       = boost::beast::http;
-namespace net        = boost::asio;
-namespace ssl        = boost::asio::ssl;
-using     tcp        = boost::asio::ip::tcp;
-using     json_dextools = nlohmann::json;
-namespace json_node  = boost::json;
+namespace beast     = boost::beast;            // из <boost/beast.hpp>
+namespace websocket = beast::websocket;        // из <boost/beast/websocket.hpp>
+namespace net       = boost::asio;             // из <boost/asio.hpp>
+using     tcp       = net::ip::tcp;            // из <boost/asio/ip/tcp.hpp>
+namespace json      = boost::json;
 
-// --------------------
-// Глобальные структуры
-// --------------------
+// Генератор requestId для JSON-RPC (1 уже занят «eth_subscribe»)
+static std::atomic<int> nextRequestId{2};
 
+// Структура для временного хранения деталей лога, пока не придёт timestamp
 struct LogInfo {
     std::string contract;
     std::string blockHex;
@@ -41,29 +33,11 @@ struct LogInfo {
     std::string fromOrTo;
 };
 
-static std::atomic<int> nextRequestId{2};
+// Здесь храним все незавершённые запросы «eth_getBlockByNumber», чтобы потом сопоставить ответ с нужным логом
+static std::mutex                          pendingMutex;
+static std::unordered_map<int, LogInfo>    pendingRequests;
 
-static std::mutex                         pendingMutex;
-static std::unordered_map<int, LogInfo>   pendingRequests;
-
-struct EventInfo {
-    uint64_t       blockNum            = 0;
-    uint64_t       blockchainTimestamp = 0;
-    std::chrono::system_clock::time_point dexSystemTime;
-    std::chrono::steady_clock::time_point  dexArrival;
-    std::chrono::system_clock::time_point nodeSystemTime;
-    std::chrono::steady_clock::time_point  nodeArrival;
-    bool           gotDex              = false;
-    bool           gotNode             = false;
-};
-
-static std::mutex                                  globalMutex;
-static std::unordered_map<std::string, EventInfo>  eventsMap;
-
-// --------------------
-// Утилиты
-// --------------------
-
+// Утилита: читаем из «0x...»-строки беззнаковое 64-битное число
 uint64_t parseHexUint64(const std::string& hexStr) {
     uint64_t value = 0;
     std::size_t start = 0;
@@ -78,292 +52,160 @@ uint64_t parseHexUint64(const std::string& hexStr) {
     return value;
 }
 
-std::string toStringSys(const std::chrono::system_clock::time_point& tp) {
-    auto tt = std::chrono::system_clock::to_time_t(tp);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()) % 1000;
-    std::tm buf;
-#if defined(_WIN32) || defined(_WIN64)
-    localtime_s(&buf, &tt);
-#else
-    localtime_r(&tt, &buf);
-#endif
-    char str[64];
-    std::strftime(str, sizeof(str), "%F %T", &buf);
-    char result[80];
-    std::snprintf(result, sizeof(result), "%s.%03lld", str, static_cast<long long>(ms.count()));
-    return std::string(result);
+// Когда у нас есть LogInfo + timestamp, печатаем итог в человеко-читаемом виде:
+void printLog(const LogInfo& info, uint64_t timestamp) {
+    uint64_t blockNum = parseHexUint64(info.blockHex);
+    uint64_t logIndex = parseHexUint64(info.logIndexHex);
+
+    // Текущее системное время в миллисекундах с эпохи
+    auto now = std::chrono::system_clock::now();
+    auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    // Блок-таймстемп в миллисекундах
+    uint64_t blockMs = timestamp * 1000;
+
+    // Разница (пинг) в миллисекундах
+    int64_t ping = static_cast<int64_t>(nowMs) - static_cast<int64_t>(blockMs);
+
+    std::cout << "Событие Swap:\n"
+              << "  — Контракт:     " << info.contract   << "\n"
+              << "  — Блок:         " << blockNum        << "\n"
+              << "  — TxHash:       " << info.txHash     << "\n"
+              << "  — logIndex:     " << logIndex        << "\n"
+              << "  — sender:       " << info.sender     << "\n"
+              << "  — fromOrTo:     " << info.fromOrTo   << "\n"
+              << "  — timestamp:    " << timestamp       << "\n"
+              << "  — ping (ms):    " << ping            << "\n\n";
 }
 
-void printComparison(const std::string& txHash, const EventInfo& info) {
-    auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(info.nodeArrival - info.dexArrival).count();
-    std::cout << "============================================\n";
-    std::cout << "Block:            " << info.blockNum << "\n";
-    std::cout << "TxHash:           " << txHash << "\n";
-    std::cout << "BlockTimestamp:   " << info.blockchainTimestamp << "\n\n";
-    std::cout << "DEXTools Arrival: " << toStringSys(info.dexSystemTime) << "\n";
-    std::cout << "Node    Arrival:  " << toStringSys(info.nodeSystemTime) << "\n";
-    std::cout << "Delta (node - dex) = " << delta << " ms\n";
-    std::cout << "============================================\n\n";
-}
-
-// --------------------
-// Чтение из DEXTools (SSL WebSocket)
-// --------------------
-void do_read_dex(
-    std::shared_ptr<websocket::stream<beast::ssl_stream<beast::tcp_stream>>> ws_ptr,
-    std::shared_ptr<beast::flat_buffer>                                 buffer_ptr)
-{
-    ws_ptr->async_read(
-        *buffer_ptr,
-        [ws_ptr, buffer_ptr](beast::error_code ec, std::size_t)
-        {
-            if(ec) {
-                std::cerr << "DEX Read error: " << ec.message() << "\n";
-                return;
-            }
-            std::string text = beast::buffers_to_string(buffer_ptr->data());
-            buffer_ptr->consume(buffer_ptr->size());
-            try {
-                auto j = json_dextools::parse(text);
-                if(j.contains("result") && j["result"].contains("data")) {
-                    auto data = j["result"]["data"];
-                    if(data.is_string()) {
-                        // Статус «ready» — можно опустить
-                    }
-                    else if(data.is_object() && data.contains("event")) {
-                        std::string event = data["event"].get<std::string>();
-                        if(event == "swaps" && data.contains("swaps") && data.contains("id")) {
-                            for(const auto& swap : data["swaps"]) {
-                                std::string txHash    = swap.value("id", "");
-                                uint64_t    blockNum  = swap.value("blockNumber", 0);
-                                uint64_t    blkTs     = swap.value("timestamp", 0LL);
-                                auto now_sys    = std::chrono::system_clock::now();
-                                auto now_steady = std::chrono::steady_clock::now();
-                                std::cout << "[DEX] Swap received: txHash=" << txHash
-                                          << " block=" << blockNum
-                                          << " blkTs=" << blkTs << "\n";
-                                {
-                                    std::lock_guard<std::mutex> lg(globalMutex);
-                                    EventInfo& info = eventsMap[txHash];
-                                    info.blockNum            = blockNum;
-                                    info.blockchainTimestamp = blkTs;
-                                    info.dexSystemTime       = now_sys;
-                                    info.dexArrival          = now_steady;
-                                    info.gotDex              = true;
-                                    if(info.gotNode) {
-                                        printComparison(txHash, info);
-                                        eventsMap.erase(txHash);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            catch(const std::exception&) {
-                // Не JSON — пропускаем
-            }
-            do_read_dex(ws_ptr, buffer_ptr);
-        });
-}
-
-// --------------------
-// Чтение из приватного нода (Plain WebSocket)
-// --------------------
-void do_read_node(
+// Асинхронное чтение из WebSocket, тут парсим JSON-RPC ответы и уведомления
+void do_read(
     std::shared_ptr<websocket::stream<tcp::socket>> ws_ptr,
-    std::shared_ptr<beast::flat_buffer>            buffer_ptr)
+    std::shared_ptr<beast::flat_buffer> buffer_ptr)
 {
     ws_ptr->async_read(
         *buffer_ptr,
         [ws_ptr, buffer_ptr](beast::error_code ec, std::size_t)
         {
-            if(ec) {
-                std::cerr << "Node Read error: " << ec.message() << "\n";
+            if (ec) {
+                std::cerr << "Read error: " << ec.message() << "\n";
                 return;
             }
+
+            // Считываем весь полученный текст
             std::string text = beast::buffers_to_string(buffer_ptr->data());
             buffer_ptr->consume(buffer_ptr->size());
-            json_node::value parsed;
+
+            // Парсим JSON
+            json::value parsed;
             try {
-                parsed = json_node::parse(text);
+                parsed = json::parse(text);
             }
-            catch(const std::exception& e) {
-                std::cerr << "[NODE] JSON parse error: " << e.what() << "\n";
-                do_read_node(ws_ptr, buffer_ptr);
+            catch (const std::exception& e) {
+                std::cerr << "JSON parse error: " << e.what() << "\n";
+                // Запускаем следующий цикл чтения и выходим
+                do_read(ws_ptr, buffer_ptr);
                 return;
             }
+
             auto obj = parsed.as_object();
-            if(obj.if_contains("method") && obj["method"].as_string() == "eth_subscription") {
+
+            // 1) Если это уведомление от «eth_subscription» (новый лог)
+            if (obj.if_contains("method") && obj["method"].as_string() == "eth_subscription") {
                 auto params = obj["params"].as_object();
                 auto result = params["result"].as_object();
+
+                // Собираем детали лога в LogInfo
                 LogInfo info;
                 info.contract    = result["address"].as_string().c_str();
                 info.blockHex    = result["blockNumber"].as_string().c_str();
                 info.txHash      = result["transactionHash"].as_string().c_str();
                 info.logIndexHex = result["logIndex"].as_string().c_str();
-                auto& topics = result["topics"].as_array();
-                if(topics.size() >= 3) {
+
+                // «topics» — это массив из 3 элементов:
+                // [0] = сигнатура события,
+                // [1] = indexed sender,
+                // [2] = indexed fromOrTo.
+                auto topics = result["topics"].as_array();
+                if (topics.size() >= 3) {
                     std::string t1 = topics[1].as_string().c_str();
                     std::string t2 = topics[2].as_string().c_str();
-                    if(t1.size() >= 40) info.sender   = "0x" + t1.substr(t1.size() - 40);
-                    if(t2.size() >= 40) info.fromOrTo = "0x" + t2.substr(t2.size() - 40);
+                    // Берём последние 40 символов после «0x»
+                    if (t1.size() >= 40) info.sender   = "0x" + t1.substr(t1.size() - 40);
+                    if (t2.size() >= 40) info.fromOrTo = "0x" + t2.substr(t2.size() - 40);
                 }
-                int reqId = nextRequestId.fetch_add(1);
+
+                // Генерируем новый requestId для запроса блока
+                int     reqId = nextRequestId.fetch_add(1);
                 {
                     std::lock_guard<std::mutex> lg(pendingMutex);
                     pendingRequests[reqId] = info;
                 }
-                json_node::object blockReq;
+
+                // Собираем JSON-RPC-запрос eth_getBlockByNumber
+                json::object blockReq;
                 blockReq["jsonrpc"] = "2.0";
                 blockReq["id"]      = reqId;
                 blockReq["method"]  = "eth_getBlockByNumber";
-                json_node::array arr;
-                arr.push_back(json_node::value(info.blockHex));
-                arr.push_back(json_node::value(false));
+                json::array arr;
+                arr.push_back(json::value(info.blockHex));
+                arr.push_back(json::value(false));
                 blockReq["params"] = arr;
-                std::string reqText = json_node::serialize(blockReq);
+
+                std::string reqText = json::serialize(blockReq);
                 ws_ptr->write(net::buffer(reqText));
-                std::cout << "[NODE] Sent eth_getBlockByNumber for blockHex=" << info.blockHex
-                          << " (reqId=" << reqId << ", txHash=" << info.txHash << ")\n";
             }
-            else if(obj.if_contains("id") && obj.if_contains("result")) {
+            // 2) Если это ответ на «eth_getBlockByNumber» (есть поле «result» с блоком)
+            else if (obj.if_contains("id") && obj.if_contains("result")) {
                 int respId = obj["id"].to_number<int>();
-                LogInfo info_copy;
+
+                LogInfo info;
                 {
                     std::lock_guard<std::mutex> lg(pendingMutex);
                     auto it = pendingRequests.find(respId);
-                    if(it == pendingRequests.end()) {
-                        do_read_node(ws_ptr, buffer_ptr);
+                    if (it == pendingRequests.end()) {
+                        // Неожиданный id — просто игнорируем
+                        do_read(ws_ptr, buffer_ptr);
                         return;
                     }
-                    info_copy = it->second;
+                    info = it->second;
                     pendingRequests.erase(it);
                 }
+
+                // Внутри «result» — объект блока, есть «timestamp» в hex
                 auto blockObj = obj["result"].as_object();
                 std::string tsHex = blockObj["timestamp"].as_string().c_str();
                 uint64_t tsVal = parseHexUint64(tsHex);
-                auto now_sys    = std::chrono::system_clock::now();
-                auto now_steady = std::chrono::steady_clock::now();
-                std::cout << "[NODE] Received block " << info_copy.blockHex
-                          << " timestamp=0x" << tsHex
-                          << " → " << tsVal
-                          << " for txHash=" << info_copy.txHash << "\n";
-                {
-                    std::lock_guard<std::mutex> lg(globalMutex);
-                    auto it_ev = eventsMap.find(info_copy.txHash);
-                    if(it_ev == eventsMap.end()) {
-                        EventInfo ev;
-                        ev.blockNum            = parseHexUint64(info_copy.blockHex);
-                        ev.blockchainTimestamp = tsVal;
-                        ev.nodeSystemTime      = now_sys;
-                        ev.nodeArrival         = now_steady;
-                        ev.gotNode             = true;
-                        eventsMap[info_copy.txHash] = ev;
-                    }
-                    else {
-                        EventInfo& ev = it_ev->second;
-                        ev.blockNum            = parseHexUint64(info_copy.blockHex);
-                        ev.blockchainTimestamp = tsVal;
-                        ev.nodeSystemTime      = now_sys;
-                        ev.nodeArrival         = now_steady;
-                        ev.gotNode             = true;
-                        if(ev.gotDex) {
-                            printComparison(info_copy.txHash, ev);
-                            eventsMap.erase(it_ev);
-                        }
-                    }
-                }
+
+                // Выводим полный человеко-читаемый лог
+                printLog(info, tsVal);
             }
-            do_read_node(ws_ptr, buffer_ptr);
+            // Иначе — игнорируем
+
+            // Запускаем следующий асинхронный read
+            do_read(ws_ptr, buffer_ptr);
         });
 }
 
-// --------------------
-// main()
-// --------------------
-int main()
-{
-    try
-    {
-        //
-        // === ПОДКЛЮЧЕНИЕ К DEXTOOLS (SSL WebSocket) С ПРИНУДИТЕЛЬНЫМ IPv4 + Origin ===
-        //
-        const std::string dexHost = "ws.dextools.io";
-        const std::string dexPort = "443";
+int main() {
+    try {
+        // Подставьте сюда IP/порт вашей ноды
+        std::string const host = "35.193.95.176";
+        std::string const port = "8546";
 
         net::io_context   ioc;
         tcp::resolver     resolver{ioc};
+        auto const        endpoints = resolver.resolve(host, port);
 
-        auto const dexResults = resolver.resolve(dexHost, dexPort);
+        // Открываем WebSocket поверх TCP
+        auto ws_ptr = std::make_shared<websocket::stream<tcp::socket>>(ioc.get_executor());
+        net::connect(ws_ptr->next_layer(), endpoints);
 
-        beast::tcp_stream tcpStream{ioc};
-        bool connected_v4 = false;
-        for (auto const& entry : dexResults) {
-            if (entry.endpoint().address().is_v4()) {
-                tcpStream.connect(entry.endpoint());
-                connected_v4 = true;
-                break;
-            }
-        }
-        if (!connected_v4) {
-            std::cerr << "Error: не удалось найти IPv4-адрес для " << dexHost << "\n";
-            return EXIT_FAILURE;
-        }
+        // Делаем WebSocket handshake
+        ws_ptr->handshake(host + ":" + port, "/");
+        std::cout << "Connected to ws://" << host << ":" << port << "\n\n";
 
-        ssl::context ctx{ssl::context::tlsv12_client};
-        ctx.set_default_verify_paths();
-        ctx.set_verify_mode(ssl::verify_peer);
-
-        beast::ssl_stream<beast::tcp_stream> sslStream{std::move(tcpStream), ctx};
-        if(!SSL_set_tlsext_host_name(sslStream.native_handle(), dexHost.c_str()))
-            std::cerr << "Warning: не удалось установить SNI hostname для DEXTools\n";
-        sslStream.handshake(ssl::stream_base::client);
-
-        auto ws_dex = std::make_shared<websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(
-            std::move(sslStream)
-        );
-
-        // Декоратор устанавливает одновременно User-Agent и Origin
-        ws_dex->set_option(websocket::stream_base::decorator(
-            [&](websocket::request_type& req)
-            {
-                req.set(http::field::user_agent,
-                        std::string(BOOST_BEAST_VERSION_STRING) + " combinedScript");
-                req.set(http::field::origin, "https://dextools.io");
-            }));
-        ws_dex->handshake(dexHost, "/");
-        std::cout << "[DEX] Connected! (wss://" << dexHost << "/)\n";
-
-        std::string subscribe_dex = R"({
-  "jsonrpc": "2.0",
-  "method": "subscribe",
-  "params": {
-    "chain": "bsc",
-    "channel": "bsc:pair:0x98d6e81f14b2278455311738267d6cf93160be35"
-  },
-  "id": "bsc"
-})";
-        ws_dex->write(net::buffer(subscribe_dex));
-        std::cout << "[DEX] Sent subscribe:\n" << subscribe_dex << "\n\n";
-
-        auto buffer_dex = std::make_shared<beast::flat_buffer>();
-        do_read_dex(ws_dex, buffer_dex);
-
-        //
-        // === ПОДКЛЮЧЕНИЕ К НОДУ (Plain WebSocket) ===
-        //
-        const std::string nodeHost = "localhost";
-        const std::string nodePort = "8546";
-
-        auto nodeEndpoints = resolver.resolve(nodeHost, nodePort);
-        auto ws_node = std::make_shared<websocket::stream<tcp::socket>>(ioc);
-        net::connect(ws_node->next_layer(), nodeEndpoints);
-
-        ws_node->handshake(nodeHost + ":" + nodePort, "/");
-        std::cout << "[NODE] Connected! (ws://" << nodeHost << ":" << nodePort << ")\n";
-
-        std::string subscribe_node = R"({
+        // Шаблон JSON для подписки на логи контракта
+        std::string subscribe_msg = R"({
   "jsonrpc": "2.0",
   "id": 1,
   "method": "eth_subscribe",
@@ -374,19 +216,21 @@ int main()
     }
   ]
 })";
-        ws_node->write(net::buffer(subscribe_node));
-        std::cout << "[NODE] Sent subscription:\n" << subscribe_node << "\n\n";
 
-        auto buffer_node = std::make_shared<beast::flat_buffer>();
-        do_read_node(ws_node, buffer_node);
+        // Отправляем запрос на подписку
+        ws_ptr->write(net::buffer(subscribe_msg));
+        std::cout << "Sent subscription:\n" << subscribe_msg << "\n\n";
 
+        // Запускаем асинхронное чтение
+        auto buffer_ptr = std::make_shared<beast::flat_buffer>();
+        do_read(ws_ptr, buffer_ptr);
+
+        // Выход из run() только при error или когда процесс завершается
         ioc.run();
     }
-    catch(std::exception const& e)
-    {
+    catch (std::exception const& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return EXIT_FAILURE;
     }
-
     return EXIT_SUCCESS;
 }
