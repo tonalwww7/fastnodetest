@@ -1,23 +1,16 @@
-cmake_minimum_required(VERSION 3.5)
-project(testDexTools)
+cmake_minimum_required(VERSION 3.10)
+project(bsc_mempool_latency)
 
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# We will use Boost.Beast (header-only) on top of Boost.Asio, and OpenSSL for TLS.
-find_package(Boost REQUIRED COMPONENTS system json)
+set(Boost_USE_MULTITHREADED ON)
+find_package(Boost 1.75.0 REQUIRED COMPONENTS system thread)
 find_package(OpenSSL REQUIRED)
 
-add_executable(testDexTools
-    main.cpp
-)
-
-# Beast headers live under Boost/include, System library provides Asio, Beast, etc.
-target_include_directories(testDexTools PRIVATE ${Boost_INCLUDE_DIRS})
-target_link_libraries(testDexTools PRIVATE
-    Boost::system
-    OpenSSL::SSL
-    Boost::json
-    OpenSSL::Crypto
-    pthread        # on Unix/macOS you also need pthread
+add_executable(testLatency main.cpp)
+target_link_libraries(testLatency
+    PRIVATE
+      Boost::system
+      Boost::thread
+      OpenSSL::SSL
+      OpenSSL::Crypto
 )
