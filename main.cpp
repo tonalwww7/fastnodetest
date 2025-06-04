@@ -64,7 +64,7 @@ void do_read(
             }
             auto obj = parsed.as_object();
 
-            // Ответ на eth_sendTransaction (id == 2)
+            // Если это просто ответ на eth_sendTransaction (id == 2) — запомним sentTxHash
             if (obj.if_contains("id") && obj["id"].is_int64()) {
                 int id = static_cast<int>(obj["id"].as_int64());
                 if (id == 2) {
@@ -74,25 +74,30 @@ void do_read(
                         std::cout << "[INFO] eth_sendTransaction вернул txHash: " << txh << "\n";
                     }
                     else if (obj.if_contains("error")) {
-                        // Здесь заменили obj["error"].serialize() на boost::json::serialize(obj["error"])
                         std::cerr << "[ERROR] eth_sendTransaction error: "
                                   << boost::json::serialize(obj["error"]) << "\n";
                     }
                 }
             }
 
-            // Уведомление newPendingTransactions
+            // Если это уведомление о newPendingTransactions
             if (obj.if_contains("method")
                 && obj["method"].as_string() == "eth_subscription"
                 && obj.if_contains("params"))
             {
                 auto params = obj["params"].as_object();
+                // "result" здесь — это hash новой транзакции
                 if (params.if_contains("result") && params["result"].is_string()) {
                     auto incomingTxHash = params["result"].as_string().c_str();
+
+                    // Сразу выведем любой новый приходящий txHash
+                    std::cout << "[SUB] incoming txHash: " << incomingTxHash;
                     if (sentTxHash.has_value() && incomingTxHash == sentTxHash.value()) {
+                        // Если это тот же txHash, который мы отправили, — считаем задержку
                         uint64_t nowReceiveMs = nowMs();
                         int64_t diff = static_cast<int64_t>(nowReceiveMs) - static_cast<int64_t>(txSendMs);
 
+                        std::cout << "  <-- match! Δ = " << diff << " ms\n";
                         std::cout << "\n[RESULT] Нода получила нашу транзакцию в mempool:\n";
                         std::cout << "         txHash       = " << incomingTxHash << "\n";
                         std::cout << "         txSendMs     = " << txSendMs << " ms\n";
@@ -100,6 +105,9 @@ void do_read(
                         std::cout << "         Задержка mempool→нода = " << diff << " ms\n\n";
                         std::cout << "[INFO] Завершаем работу.\n";
                         std::exit(EXIT_SUCCESS);
+                    }
+                    else {
+                        std::cout << "\n";
                     }
                 }
             }
@@ -135,28 +143,28 @@ int main()
         );
 
         ws_ptr->handshake(host + ":" + port, "/");
-        std::cout << "[INFO] Connected to ws://" << host << ":" << port << "\n";
+        std::cout << "[INFO] Connected to ws://127.0.0.1:8546\n";
 
         // Сразу после handshake шлём ping (WebSocket RTT)
         pingSentTime = std::chrono::steady_clock::now();
         ws_ptr->ping({});
 
-        // Подписываемся на newPendingTransactions (id = 1)
+        // 1) Подписываемся на newPendingTransactions
         {
             json::object subObj;
             subObj["jsonrpc"] = "2.0";
             subObj["id"]      = 1;
             subObj["method"]  = "eth_subscribe";
-            json::array arr; arr.push_back("newPendingTransactions");
+            json::array     arr; arr.push_back("newPendingTransactions");
             subObj["params"] = arr;
 
             ws_ptr->write(net::buffer(boost::json::serialize(subObj)));
             std::cout << "[INFO] Отправили подписку: eth_subscribe(\"newPendingTransactions\")\n";
         }
 
-        // Отправляем eth_sendTransaction от вашего разблокированного аккаунта
+        // 2) Отправляем свою транзакцию (eth_sendTransaction)
         {
-            // Замените адрес ниже на ваш адрес (в нижнем регистре)
+            // ← Замените адрес на ваш (в нижнем регистре):
             const std::string myAddress = "0x6f8dd885384f8d3671f0e7991c1937ded12d29c0";
 
             json::object tx;
@@ -178,6 +186,7 @@ int main()
             std::cout << "[INFO] Отправили eth_sendTransaction, txSendMs = " << txSendMs << " ms\n";
         }
 
+        // Запускаем асинхронное чтение
         auto buffer_ptr = std::make_shared<beast::flat_buffer>();
         do_read(ws_ptr, buffer_ptr);
         ioc.run();
