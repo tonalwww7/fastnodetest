@@ -189,7 +189,7 @@ void do_read(
 int main() {
     try {
         // Подставьте сюда IP/порт вашей ноды
-        std::string const host = "35.193.95.176";
+        std::string const host = "127.0.0.1";
         std::string const port = "8546";
 
         net::io_context   ioc;
