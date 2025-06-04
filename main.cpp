@@ -351,29 +351,43 @@ int main()
     try
     {
         //
-        // === ПОДКЛЮЧЕНИЕ К DEXTOOLS (SSL WebSocket) ===
+        // === ПОДКЛЮЧЕНИЕ К DEXTOOLS (SSL WebSocket) С ПРИНУДИТЕЛЬНЫМ IPv4 ===
         //
         const std::string dexHost = "ws.dextools.io";
         const std::string dexPort = "443";
 
         net::io_context              ioc;
         tcp::resolver                resolver{ioc};
-        auto const                   dexEndpoints = resolver.resolve(dexHost, dexPort);
 
-        // Настраиваем TLS-контекст
+        // Резолвим все A/AAAA записи, но потом выберем из них только IPv4
+        auto const dexResults = resolver.resolve(dexHost, dexPort);
+
+        // Найдём первую IPv4-сущность и подключимся к ней
+        beast::tcp_stream tcpStream{ioc};
+        bool connected_v4 = false;
+        for (auto const& entry : dexResults) {
+            if (entry.endpoint().address().is_v4()) {
+                tcpStream.connect(entry.endpoint());
+                connected_v4 = true;
+                break;
+            }
+        }
+        if (!connected_v4) {
+            std::cerr << "Error: не удалось найти IPv4-адрес для " << dexHost << "\n";
+            return EXIT_FAILURE;
+        }
+
+        // Оборачиваем TCP→SSL
         ssl::context ctx{ssl::context::tlsv12_client};
         ctx.set_default_verify_paths();
         ctx.set_verify_mode(ssl::verify_peer);
 
-        // Обычное TCP → SSL → WebSocket
-        beast::tcp_stream                        tcpStream{ioc};
-        tcpStream.connect(dexEndpoints);
-
-        beast::ssl_stream<beast::tcp_stream>     sslStream{std::move(tcpStream), ctx};
+        beast::ssl_stream<beast::tcp_stream> sslStream{std::move(tcpStream), ctx};
         if(!SSL_set_tlsext_host_name(sslStream.native_handle(), dexHost.c_str()))
             std::cerr << "Warning: не удалось установить SNI hostname для DEXTools\n";
         sslStream.handshake(ssl::stream_base::client);
 
+        // WebSocket поверх SSL
         auto ws_dex = std::make_shared<websocket::stream<beast::ssl_stream<beast::tcp_stream>>>(
             std::move(sslStream)
         );
