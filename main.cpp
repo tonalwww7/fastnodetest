@@ -1,4 +1,3 @@
-
 // main.cpp
 
 #include <boost/beast/core.hpp>
@@ -75,8 +74,9 @@ void do_read(
                         std::cout << "[INFO] eth_sendTransaction вернул txHash: " << txh << "\n";
                     }
                     else if (obj.if_contains("error")) {
+                        // Здесь заменили obj["error"].serialize() на boost::json::serialize(obj["error"])
                         std::cerr << "[ERROR] eth_sendTransaction error: "
-                                  << obj["error"].serialize() << "\n";
+                                  << boost::json::serialize(obj["error"]) << "\n";
                     }
                 }
             }
@@ -150,7 +150,7 @@ int main()
             json::array arr; arr.push_back("newPendingTransactions");
             subObj["params"] = arr;
 
-            ws_ptr->write(net::buffer(json::serialize(subObj)));
+            ws_ptr->write(net::buffer(boost::json::serialize(subObj)));
             std::cout << "[INFO] Отправили подписку: eth_subscribe(\"newPendingTransactions\")\n";
         }
 
@@ -174,7 +174,7 @@ int main()
             sendObj["params"] = paramsArr;
 
             txSendMs = nowMs();
-            ws_ptr->write(net::buffer(json::serialize(sendObj)));
+            ws_ptr->write(net::buffer(boost::json::serialize(sendObj)));
             std::cout << "[INFO] Отправили eth_sendTransaction, txSendMs = " << txSendMs << " ms\n";
         }
 
