@@ -1,3 +1,4 @@
+
 // main.cpp
 
 #include <boost/beast/core.hpp>
@@ -9,227 +10,180 @@
 #include <iostream>
 #include <memory>
 #include <string>
-#include <unordered_map>
-#include <atomic>
-#include <mutex>
+#include <optional>
 #include <chrono>
 
-namespace beast     = boost::beast;            // из <boost/beast.hpp>
-namespace websocket = beast::websocket;        // из <boost/beast/websocket.hpp>
-namespace net       = boost::asio;             // из <boost/asio.hpp>
-using     tcp       = net::ip::tcp;            // из <boost/asio/ip/tcp.hpp>
+namespace beast     = boost::beast;
+namespace websocket = beast::websocket;
+namespace net       = boost::asio;
+using     tcp       = net::ip::tcp;
 namespace json      = boost::json;
 
-// Генератор requestId для JSON-RPC (1 уже занят «eth_subscribe»)
-static std::atomic<int> nextRequestId{2};
-
-// Структура для временного хранения деталей лога, пока не придёт timestamp
-struct LogInfo {
-    std::string contract;
-    std::string blockHex;
-    std::string txHash;
-    std::string logIndexHex;
-    std::string sender;
-    std::string fromOrTo;
-};
-
-// Здесь храним все незавершённые запросы «eth_getBlockByNumber», чтобы потом сопоставить ответ с нужным логом
-static std::mutex                          pendingMutex;
-static std::unordered_map<int, LogInfo>    pendingRequests;
-
-// Утилита: читаем из «0x...»-строки беззнаковое 64-битное число
-uint64_t parseHexUint64(const std::string& hexStr) {
-    uint64_t value = 0;
-    std::size_t start = 0;
-    if (hexStr.rfind("0x", 0) == 0) start = 2;
-    for (std::size_t i = start; i < hexStr.size(); ++i) {
-        value <<= 4;
-        char c = hexStr[i];
-        if (c >= '0' && c <= '9')       value |= (c - '0');
-        else if (c >= 'a' && c <= 'f')  value |= (c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F')  value |= (c - 'A' + 10);
-    }
-    return value;
+// Возвращает текущее время в миллисекундах от эпохи
+static uint64_t nowMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count()
+    );
 }
 
-// Когда у нас есть LogInfo + timestamp, печатаем итог в человеко-читаемом виде:
-void printLog(const LogInfo& info, uint64_t timestamp) {
-    uint64_t blockNum = parseHexUint64(info.blockHex);
-    uint64_t logIndex = parseHexUint64(info.logIndexHex);
+// Глобальные переменные для состояния
+static std::optional<std::string> sentTxHash; // сюда запомним txHash из eth_sendTransaction
+static uint64_t                     txSendMs = 0; // время (ms) отправки транзакции
 
-    // Текущее системное время в миллисекундах с эпохи
-    auto now = std::chrono::system_clock::now();
-    auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    // Блок-таймстемп в миллисекундах
-    uint64_t blockMs = timestamp * 1000;
-
-    // Разница (пинг) в миллисекундах
-    int64_t ping = static_cast<int64_t>(nowMs) - static_cast<int64_t>(blockMs);
-
-    std::cout << "Событие Swap:\n"
-              << "  — Контракт:     " << info.contract   << "\n"
-              << "  — Блок:         " << blockNum        << "\n"
-              << "  — TxHash:       " << info.txHash     << "\n"
-              << "  — logIndex:     " << logIndex        << "\n"
-              << "  — sender:       " << info.sender     << "\n"
-              << "  — fromOrTo:     " << info.fromOrTo   << "\n"
-              << "  — timestamp:    " << timestamp       << "\n"
-              << "  — ping (ms):    " << ping            << "\n\n";
-}
-
-// Асинхронное чтение из WebSocket, тут парсим JSON-RPC ответы и уведомления
+// Асинхронное чтение из WebSocket
 void do_read(
     std::shared_ptr<websocket::stream<tcp::socket>> ws_ptr,
-    std::shared_ptr<beast::flat_buffer> buffer_ptr)
+    std::shared_ptr<beast::flat_buffer>            buffer_ptr)
 {
     ws_ptr->async_read(
         *buffer_ptr,
         [ws_ptr, buffer_ptr](beast::error_code ec, std::size_t)
         {
             if (ec) {
-                std::cerr << "Read error: " << ec.message() << "\n";
+                std::cerr << "[ERROR] Read error: " << ec.message() << "\n";
                 return;
             }
 
-            // Считываем весь полученный текст
             std::string text = beast::buffers_to_string(buffer_ptr->data());
             buffer_ptr->consume(buffer_ptr->size());
 
-            // Парсим JSON
             json::value parsed;
             try {
                 parsed = json::parse(text);
             }
             catch (const std::exception& e) {
-                std::cerr << "JSON parse error: " << e.what() << "\n";
-                // Запускаем следующий цикл чтения и выходим
+                std::cerr << "[ERROR] JSON parse error: " << e.what() << "\n";
                 do_read(ws_ptr, buffer_ptr);
                 return;
             }
 
+            if (!parsed.is_object()) {
+                do_read(ws_ptr, buffer_ptr);
+                return;
+            }
             auto obj = parsed.as_object();
 
-            // 1) Если это уведомление от «eth_subscription» (новый лог)
-            if (obj.if_contains("method") && obj["method"].as_string() == "eth_subscription") {
-                auto params = obj["params"].as_object();
-                auto result = params["result"].as_object();
-
-                // Собираем детали лога в LogInfo
-                LogInfo info;
-                info.contract    = result["address"].as_string().c_str();
-                info.blockHex    = result["blockNumber"].as_string().c_str();
-                info.txHash      = result["transactionHash"].as_string().c_str();
-                info.logIndexHex = result["logIndex"].as_string().c_str();
-
-                // «topics» — это массив из 3 элементов:
-                // [0] = сигнатура события,
-                // [1] = indexed sender,
-                // [2] = indexed fromOrTo.
-                auto topics = result["topics"].as_array();
-                if (topics.size() >= 3) {
-                    std::string t1 = topics[1].as_string().c_str();
-                    std::string t2 = topics[2].as_string().c_str();
-                    // Берём последние 40 символов после «0x»
-                    if (t1.size() >= 40) info.sender   = "0x" + t1.substr(t1.size() - 40);
-                    if (t2.size() >= 40) info.fromOrTo = "0x" + t2.substr(t2.size() - 40);
-                }
-
-                // Генерируем новый requestId для запроса блока
-                int     reqId = nextRequestId.fetch_add(1);
-                {
-                    std::lock_guard<std::mutex> lg(pendingMutex);
-                    pendingRequests[reqId] = info;
-                }
-
-                // Собираем JSON-RPC-запрос eth_getBlockByNumber
-                json::object blockReq;
-                blockReq["jsonrpc"] = "2.0";
-                blockReq["id"]      = reqId;
-                blockReq["method"]  = "eth_getBlockByNumber";
-                json::array arr;
-                arr.push_back(json::value(info.blockHex));
-                arr.push_back(json::value(false));
-                blockReq["params"] = arr;
-
-                std::string reqText = json::serialize(blockReq);
-                ws_ptr->write(net::buffer(reqText));
-            }
-            // 2) Если это ответ на «eth_getBlockByNumber» (есть поле «result» с блоком)
-            else if (obj.if_contains("id") && obj.if_contains("result")) {
-                int respId = obj["id"].to_number<int>();
-
-                LogInfo info;
-                {
-                    std::lock_guard<std::mutex> lg(pendingMutex);
-                    auto it = pendingRequests.find(respId);
-                    if (it == pendingRequests.end()) {
-                        // Неожиданный id — просто игнорируем
-                        do_read(ws_ptr, buffer_ptr);
-                        return;
+            // Ответ на eth_sendTransaction (id == 2)
+            if (obj.if_contains("id") && obj["id"].is_int64()) {
+                int id = static_cast<int>(obj["id"].as_int64());
+                if (id == 2) {
+                    if (obj.if_contains("result") && obj["result"].is_string()) {
+                        auto txh = obj["result"].as_string().c_str();
+                        sentTxHash = std::string(txh);
+                        std::cout << "[INFO] eth_sendTransaction вернул txHash: " << txh << "\n";
                     }
-                    info = it->second;
-                    pendingRequests.erase(it);
+                    else if (obj.if_contains("error")) {
+                        std::cerr << "[ERROR] eth_sendTransaction error: "
+                                  << obj["error"].serialize() << "\n";
+                    }
                 }
-
-                // Внутри «result» — объект блока, есть «timestamp» в hex
-                auto blockObj = obj["result"].as_object();
-                std::string tsHex = blockObj["timestamp"].as_string().c_str();
-                uint64_t tsVal = parseHexUint64(tsHex);
-
-                // Выводим полный человеко-читаемый лог
-                printLog(info, tsVal);
             }
-            // Иначе — игнорируем
 
-            // Запускаем следующий асинхронный read
+            // Уведомление newPendingTransactions
+            if (obj.if_contains("method")
+                && obj["method"].as_string() == "eth_subscription"
+                && obj.if_contains("params"))
+            {
+                auto params = obj["params"].as_object();
+                if (params.if_contains("result") && params["result"].is_string()) {
+                    auto incomingTxHash = params["result"].as_string().c_str();
+                    if (sentTxHash.has_value() && incomingTxHash == sentTxHash.value()) {
+                        uint64_t nowReceiveMs = nowMs();
+                        int64_t diff = static_cast<int64_t>(nowReceiveMs) - static_cast<int64_t>(txSendMs);
+
+                        std::cout << "\n[RESULT] Нода получила нашу транзакцию в mempool:\n";
+                        std::cout << "         txHash       = " << incomingTxHash << "\n";
+                        std::cout << "         txSendMs     = " << txSendMs << " ms\n";
+                        std::cout << "         nowReceiveMs = " << nowReceiveMs << " ms\n";
+                        std::cout << "         Задержка mempool→нода = " << diff << " ms\n\n";
+                        std::cout << "[INFO] Завершаем работу.\n";
+                        std::exit(EXIT_SUCCESS);
+                    }
+                }
+            }
+
             do_read(ws_ptr, buffer_ptr);
         });
 }
 
-int main() {
+int main()
+{
     try {
-        // Подставьте сюда IP/порт вашей ноды
-        std::string const host = "127.0.0.1";
-        std::string const port = "8546";
+        const std::string host = "127.0.0.1";
+        const std::string port = "8546";
+        std::cout << "[INFO] Подключаемся к Geth-BSC по WS ws://" << host << ":" << port << "\n";
 
-        net::io_context   ioc;
-        tcp::resolver     resolver{ioc};
-        auto const        endpoints = resolver.resolve(host, port);
+        net::io_context ioc;
+        tcp::resolver   resolver{ioc};
+        auto            endpoints = resolver.resolve(host, port);
 
-        // Открываем WebSocket поверх TCP
         auto ws_ptr = std::make_shared<websocket::stream<tcp::socket>>(ioc.get_executor());
         net::connect(ws_ptr->next_layer(), endpoints);
 
-        // Делаем WebSocket handshake
+        // Опционально: измеряем WebSocket-RTT
+        std::chrono::steady_clock::time_point pingSentTime;
+        ws_ptr->control_callback(
+            [&](websocket::frame_type kind, beast::string_view) {
+                if (kind == websocket::frame_type::pong) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto rtt = std::chrono::duration_cast<std::chrono::milliseconds>(now - pingSentTime).count();
+                    std::cout << "[RTT] WebSocket ping↔pong RTT: " << rtt << " ms\n";
+                }
+            }
+        );
+
         ws_ptr->handshake(host + ":" + port, "/");
-        std::cout << "Connected to ws://" << host << ":" << port << "\n\n";
+        std::cout << "[INFO] Connected to ws://" << host << ":" << port << "\n";
 
-        // Шаблон JSON для подписки на логи контракта
-        std::string subscribe_msg = R"({
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "eth_subscribe",
-  "params": [
-    "logs",
-    {
-      "address": "0x98d6E81F14B2278455311738267D6Cf93160be35"
-    }
-  ]
-})";
+        // Сразу после handshake шлём ping (WebSocket RTT)
+        pingSentTime = std::chrono::steady_clock::now();
+        ws_ptr->ping({});
 
-        // Отправляем запрос на подписку
-        ws_ptr->write(net::buffer(subscribe_msg));
-        std::cout << "Sent subscription:\n" << subscribe_msg << "\n\n";
+        // Подписываемся на newPendingTransactions (id = 1)
+        {
+            json::object subObj;
+            subObj["jsonrpc"] = "2.0";
+            subObj["id"]      = 1;
+            subObj["method"]  = "eth_subscribe";
+            json::array arr; arr.push_back("newPendingTransactions");
+            subObj["params"] = arr;
 
-        // Запускаем асинхронное чтение
+            ws_ptr->write(net::buffer(json::serialize(subObj)));
+            std::cout << "[INFO] Отправили подписку: eth_subscribe(\"newPendingTransactions\")\n";
+        }
+
+        // Отправляем eth_sendTransaction от вашего разблокированного аккаунта
+        {
+            // Замените адрес ниже на ваш адрес (в нижнем регистре)
+            const std::string myAddress = "0x6f8dd885384f8d3671f0e7991c1937ded12d29c0";
+
+            json::object tx;
+            tx["from"]     = json::value(myAddress);
+            tx["to"]       = json::value(myAddress);
+            tx["value"]    = json::value("0x0");
+            tx["gasPrice"] = json::value("0x1");    // 1 wei
+            tx["gas"]      = json::value("0x5208"); // 21000
+
+            json::object sendObj;
+            sendObj["jsonrpc"] = "2.0";
+            sendObj["id"]      = 2;
+            sendObj["method"]  = "eth_sendTransaction";
+            json::array paramsArr; paramsArr.push_back(tx);
+            sendObj["params"] = paramsArr;
+
+            txSendMs = nowMs();
+            ws_ptr->write(net::buffer(json::serialize(sendObj)));
+            std::cout << "[INFO] Отправили eth_sendTransaction, txSendMs = " << txSendMs << " ms\n";
+        }
+
         auto buffer_ptr = std::make_shared<beast::flat_buffer>();
         do_read(ws_ptr, buffer_ptr);
-
-        // Выход из run() только при error или когда процесс завершается
         ioc.run();
     }
     catch (std::exception const& e) {
-        std::cerr << "Error: " << e.what() << "\n";
+        std::cerr << "[FATAL] Exception: " << e.what() << "\n";
         return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;
