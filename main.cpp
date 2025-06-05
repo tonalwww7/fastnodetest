@@ -1,225 +1,406 @@
-
-// main.cpp
-
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
-#include <boost/asio/connect.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/json.hpp>
-#include <cstdlib>
+#include <boost/beast/ssl.hpp>
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <nlohmann/json.hpp>
 #include <iostream>
-#include <memory>
-#include <string>
-#include <optional>
+#include <iomanip>
+#include <sstream>
+#include <thread>
+#include <mutex>
 #include <chrono>
-#include <unordered_map>
+#include <functional>
+#include <string>
 
-namespace beast     = boost::beast;
-namespace websocket = beast::websocket;
-namespace net       = boost::asio;
-using     tcp       = net::ip::tcp;
-namespace json      = boost::json;
+using json = nlohmann::json;
+namespace beast      = boost::beast;
+namespace websocket  = beast::websocket;
+namespace asio       = boost::asio;
+namespace ssl        = boost::asio::ssl;
+using tcp            = asio::ip::tcp;
 
-// Возвращает текущее время в миллисекундах от эпохи
-static uint64_t nowMs() {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()
-        ).count()
-    );
-}
+// Глобальный мьютекс для вывода в консоль
+static std::mutex cout_mutex;
 
-// Глобальные переменные для состояния
-static std::optional<std::string> sentTxHash; // сюда запомним txHash из eth_sendTransaction
-static uint64_t                     txSendMs = 0; // время (ms) отправки транзакции
+/**
+ * GateClient: минимальный WebSocket-клиент для Gate.io Futures
+ * – авторизация (futures.login)
+ * – размещение ордера (futures.order_place)
+ * – логирование RTT
+ */
+class GateClient {
+public:
+    GateClient(asio::io_context& ctx,
+               ssl::context& ssl_ctx,
+               const std::string& host,
+               const std::string& port,
+               const std::string& apiKey,
+               const std::string& apiSecret)
+        : ioc_(ctx)
+        , ssl_ctx_(ssl_ctx)
+        , resolver_(asio::make_strand(ioc_))
+        , ws_(asio::make_strand(ioc_), ssl_ctx_)
+        , host_(host)
+        , port_(port)
+        , apiKey_(apiKey)
+        , apiSecret_(apiSecret)
+    {}
 
-// Если до получения ответа на sendTransaction нода уже выдала уведомление с нашим hash,
-// запомним время получения в этот мап
-static std::unordered_map<std::string, uint64_t> prebuffer;
+    ~GateClient() {
+        close();
+        if (thread_.joinable())
+            thread_.join();
+    }
 
-// Асинхронное чтение из WebSocket
-void do_read(
-    std::shared_ptr<websocket::stream<tcp::socket>> ws_ptr,
-    std::shared_ptr<beast::flat_buffer>            buffer_ptr)
-{
-    ws_ptr->async_read(
-        *buffer_ptr,
-        [ws_ptr, buffer_ptr](beast::error_code ec, std::size_t)
-        {
-            if (ec) {
-                std::cerr << "[ERROR] Read error: " << ec.message() << "\n";
-                return;
-            }
-
-            std::string text = beast::buffers_to_string(buffer_ptr->data());
-            buffer_ptr->consume(buffer_ptr->size());
-
-            json::value parsed;
-            try {
-                parsed = json::parse(text);
-            }
-            catch (const std::exception& e) {
-                std::cerr << "[ERROR] JSON parse error: " << e.what() << "\n";
-                do_read(ws_ptr, buffer_ptr);
-                return;
-            }
-
-            if (!parsed.is_object()) {
-                do_read(ws_ptr, buffer_ptr);
-                return;
-            }
-            auto obj = parsed.as_object();
-
-            // 1) Если это ответ на eth_sendTransaction (id == 2), запоминаем sentTxHash
-            if (obj.if_contains("id") && obj["id"].is_int64()) {
-                int id = static_cast<int>(obj["id"].as_int64());
-                if (id == 2) {
-                    if (obj.if_contains("result") && obj["result"].is_string()) {
-                        auto txh = obj["result"].as_string().c_str();
-                        sentTxHash = std::string(txh);
-                        std::cout << "[INFO] eth_sendTransaction вернул txHash: " << txh << "\n";
-
-                        // Как только узнали sentTxHash, проверяем: 
-                        // возможно, нода уже присылала его до этого – есть в prebuffer?
-                        auto it = prebuffer.find(txh);
-                        if (it != prebuffer.end()) {
-                            uint64_t receiveMs = it->second;
-                            int64_t diff = static_cast<int64_t>(receiveMs) - static_cast<int64_t>(txSendMs);
-                            std::cout << "\n[RESULT] (пропущенный в prebuffer)\n";
-                            std::cout << "  txHash       = " << txh << "\n";
-                            std::cout << "  txSendMs     = " << txSendMs << " ms\n";
-                            std::cout << "  nowReceiveMs = " << receiveMs    << " ms\n";
-                            std::cout << "  Задержка    = " << diff           << " ms\n\n";
-                            std::cout << "[INFO] Завершаем работу.\n";
-                            std::exit(EXIT_SUCCESS);
-                        }
-                    }
-                    else if (obj.if_contains("error")) {
-                        std::cerr << "[ERROR] eth_sendTransaction error: "
-                                  << boost::json::serialize(obj["error"]) << "\n";
-                    }
-                }
-            }
-
-            // 2) Если это уведомление о newPendingTransactions
-            if (obj.if_contains("method")
-                && obj["method"].as_string() == "eth_subscription"
-                && obj.if_contains("params"))
-            {
-                auto params = obj["params"].as_object();
-                if (params.if_contains("result") && params["result"].is_string()) {
-                    auto incomingTxHash = params["result"].as_string().c_str();
-                    uint64_t receiveMs = nowMs();
-
-                    // Сразу выводим любую новую транзакцию
-                    std::cout << "[SUB] incoming txHash: " << incomingTxHash;
-
-                    // Если sentTxHash уже известно и совпало – вычисляем задержку
-                    if (sentTxHash.has_value() && incomingTxHash == sentTxHash.value()) {
-                        int64_t diff = static_cast<int64_t>(receiveMs) - static_cast<int64_t>(txSendMs);
-                        std::cout << "  <-- match! Δ = " << diff << " ms\n";
-                        std::cout << "\n[RESULT] Нода получила нашу транзакцию в mempool:\n";
-                        std::cout << "  txHash       = " << incomingTxHash << "\n";
-                        std::cout << "  txSendMs     = " << txSendMs       << " ms\n";
-                        std::cout << "  nowReceiveMs = " << receiveMs     << " ms\n";
-                        std::cout << "  Задержка    = " << diff           << " ms\n\n";
-                        std::cout << "[INFO] Завершаем работу.\n";
-                        std::exit(EXIT_SUCCESS);
-                    }
-                    else {
-                        // Если sentTxHash ещё не пришёл – буферизуем для возможного match позже
-                        if (!sentTxHash.has_value()) {
-                            prebuffer.emplace(std::string(incomingTxHash), receiveMs);
-                        }
-                        std::cout << "\n";
-                    }
-                }
-            }
-
-            do_read(ws_ptr, buffer_ptr);
+    // Запустить WS-клиент; onLogCallback – callback для логирования в консоль
+    void run(std::function<void(const std::string&)> onLogCallback) {
+        onLog_ = onLogCallback;
+        thread_ = std::thread([this]() {
+            resolver_.async_resolve(host_, port_,
+                beast::bind_front_handler(&GateClient::onResolve, this));
+            ioc_.run();
         });
-}
+    }
 
-int main()
-{
-    try {
-        const std::string host = "127.0.0.1";
-        const std::string port = "8546";
-        std::cout << "[INFO] Подключаемся к Geth-BSC по WS ws://"
-                  << host << ":" << port << "\n";
+    // Отправить futures.login
+    void sendLogin() {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(timeMutex_);
+            loginStart_ = t0;
+        }
+        uint64_t ts = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::system_clock::now().time_since_epoch()
+                      ).count();
+        std::string channel = "futures.login";
+        std::string event   = "api";
+        std::string reqParam = "";
 
-        net::io_context ioc;
-        tcp::resolver   resolver{ioc};
-        auto            endpoints = resolver.resolve(host, port);
+        // Генерируем подпись HMAC_SHA512
+        std::string sign = makeSignature(channel, event, reqParam, ts);
 
-        auto ws_ptr = std::make_shared<websocket::stream<tcp::socket>>(ioc.get_executor());
-        net::connect(ws_ptr->next_layer(), endpoints);
+        json payload = {
+            {"api_key",   apiKey_},
+            {"signature", sign},
+            {"timestamp", std::to_string(ts)},
+            {"req_id",    std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()
+                             ).count()) + "-login"}
+        };
 
-        // Измеряем WebSocket-RTT (опционально)
-        std::chrono::steady_clock::time_point pingSentTime;
-        ws_ptr->control_callback(
-            [&](websocket::frame_type kind, beast::string_view) {
-                if (kind == websocket::frame_type::pong) {
-                    auto now = std::chrono::steady_clock::now();
-                    auto rtt = std::chrono::duration_cast<std::chrono::milliseconds>(now - pingSentTime).count();
-                    std::cout << "[RTT] WebSocket ping↔pong RTT: " << rtt << " ms\n";
+        json req = baseRequest(channel, event);
+        req["payload"] = payload;
+        sendJson(req);
+    }
+
+    // Отправить futures.order_place
+    void sendPlaceOrder(const std::string& contract,
+                        int64_t size,
+                        const std::string& price,
+                        const std::string& tif,
+                        const std::string& text) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(timeMutex_);
+            orderStart_ = t0;
+        }
+        std::string channel = "futures.order_place";
+        std::string event   = "api";
+
+        json orderParam = {
+            {"contract",    contract},
+            {"size",        size},
+            {"price",       price},
+            {"tif",         tif},
+            {"text",        text},
+            {"iceberg",     0},
+            {"close",       false},
+            {"reduce_only", false},
+            {"stp_act",     "-"}
+        };
+
+        json payload = {
+            {"req_id",    std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()
+                             ).count()) + "-order"},
+            {"req_param", orderParam}
+        };
+
+        json req = baseRequest(channel, event);
+        req["payload"] = payload;
+        sendJson(req);
+    }
+
+    // Закрыть соединение
+    void close() {
+        shouldClose_ = true;
+        if (connected_) {
+            beast::error_code ec;
+            ws_.close(websocket::close_code::normal, ec);
+            if (ec) {
+                onLog_("Error closing WS: " + ec.message());
+            }
+            connected_ = false;
+        }
+    }
+
+private:
+    // Генерация HMAC_SHA512 подписи
+    std::string makeSignature(const std::string& channel,
+                              const std::string& event,
+                              const std::string& reqParam,
+                              uint64_t timestamp) {
+        std::string signString = event + "\n" + channel + "\n" + reqParam + "\n" + std::to_string(timestamp);
+        unsigned char* result = HMAC(
+            EVP_sha512(),
+            apiSecret_.c_str(), apiSecret_.length(),
+            reinterpret_cast<const unsigned char*>(signString.c_str()), signString.length(),
+            nullptr, nullptr
+        );
+        std::ostringstream oss;
+        for (unsigned int i = 0; i < 64; ++i) {
+            oss << std::hex << std::setw(2) << std::setfill('0') << (int)result[i];
+        }
+        return oss.str();
+    }
+
+    // Beast-коллбеки для асинхронного соединения/чтения/записи
+    void onResolve(beast::error_code ec, tcp::resolver::results_type results) {
+        if (ec) {
+            onLog_("Error resolve: " + ec.message());
+            return;
+        }
+        beast::get_lowest_layer(ws_.next_layer()).async_connect(
+            results,
+            beast::bind_front_handler(&GateClient::onConnect, this));
+    }
+
+    void onConnect(beast::error_code ec, tcp::resolver::results_type::endpoint_type) {
+        if (ec) {
+            onLog_("Error connect: " + ec.message());
+            return;
+        }
+        if (!SSL_set_tlsext_host_name(ws_.next_layer().native_handle(), host_.c_str())) {
+            beast::error_code errs{static_cast<int>(::ERR_get_error()), asio::error::get_ssl_category()};
+            onLog_("Error SNI: " + errs.message());
+            return;
+        }
+        ws_.next_layer().async_handshake(
+            ssl::stream_base::client,
+            beast::bind_front_handler(&GateClient::onSSLHandshake, this));
+    }
+
+    void onSSLHandshake(beast::error_code ec) {
+        if (ec) {
+            onLog_("Error SSL handshake: " + ec.message());
+            return;
+        }
+        ws_.async_handshake(host_, "/v4/ws/usdt",
+            beast::bind_front_handler(&GateClient::onHandshake, this));
+    }
+
+    void onHandshake(beast::error_code ec) {
+        if (ec) {
+            onLog_("Error WS handshake: " + ec.message());
+            return;
+        }
+        connected_ = true;
+        onLog_("WebSocket connected");
+        ws_.async_read(buffer_,
+            beast::bind_front_handler(&GateClient::onRead, this));
+    }
+
+    void onRead(beast::error_code ec, std::size_t bytes_transferred) {
+        boost::ignore_unused(bytes_transferred);
+        if (ec) {
+            if (ec == websocket::error::closed) {
+                onLog_("WebSocket closed");
+                return;
+            }
+            onLog_("Error Read: " + ec.message());
+            return;
+        }
+        std::string msg = beast::buffers_to_string(buffer_.data());
+        buffer_.consume(buffer_.size());
+        onLog_("[RECV] " + msg);
+
+        // Замер RTT для login/order_place
+        try {
+            auto j = json::parse(msg);
+            if (j.contains("header") && j["header"].contains("channel")) {
+                std::string ch = j["header"]["channel"].get<std::string>();
+                if (ch == "futures.login") {
+                    std::lock_guard<std::mutex> lk(timeMutex_);
+                    logTime("Login RTT", loginStart_);
+                }
+                else if (ch == "futures.order_place") {
+                    bool isAck = j.value("ack", false);
+                    std::lock_guard<std::mutex> lk(timeMutex_);
+                    if (isAck) {
+                        logTime("Order send → Ack RTT", orderStart_);
+                    } else {
+                        logTime("Order placed RTT", orderStart_);
+                    }
                 }
             }
-        );
-
-        ws_ptr->handshake(host + ":" + port, "/");
-        std::cout << "[INFO] Connected to ws://127.0.0.1:8546\n";
-
-        // Сразу после handshake шлём ping, чтобы измерить RTT
-        pingSentTime = std::chrono::steady_clock::now();
-        ws_ptr->ping({});
-
-        // 1) Подписываемся на newPendingTransactions
-        {
-            json::object subObj;
-            subObj["jsonrpc"] = "2.0";
-            subObj["id"]      = 1;
-            subObj["method"]  = "eth_subscribe";
-            json::array arr; arr.push_back("newPendingTransactions");
-            subObj["params"] = arr;
-
-            ws_ptr->write(net::buffer(boost::json::serialize(subObj)));
-            std::cout << "[INFO] Отправили подписку: eth_subscribe(\"newPendingTransactions\")\n";
+        } catch (...) {
+            // не JSON — игнорируем
         }
 
-        // 2) Отправляем свою транзакцию (eth_sendTransaction)
-        {
-            // ← Замените адрес на ваш (в нижнем регистре):
-            const std::string myAddress = "0x6f8dd885384f8d3671f0e7991c1937ded12d29c0";
+        ws_.async_read(buffer_,
+            beast::bind_front_handler(&GateClient::onRead, this));
+    }
 
-            json::object tx;
-            tx["from"]     = json::value(myAddress);
-            tx["to"]       = json::value(myAddress);
-            tx["value"]    = json::value("0x0");
-            tx["gasPrice"] = json::value("0x1");    // 1 wei
-            tx["gas"]      = json::value("0x5208"); // 21000
+    void onWrite(beast::error_code ec, std::size_t bytes_transferred) {
+        boost::ignore_unused(bytes_transferred);
+        if (ec) {
+            onLog_("Error Write: " + ec.message());
+        }
+    }
 
-            json::object sendObj;
-            sendObj["jsonrpc"] = "2.0";
-            sendObj["id"]      = 2;
-            sendObj["method"]  = "eth_sendTransaction";
-            json::array paramsArr; paramsArr.push_back(tx);
-            sendObj["params"] = paramsArr;
+    // Отправка JSON-сообщения (потокобезопасно)
+    void sendJson(const json& jmsg) {
+        std::string s = jmsg.dump();
+        std::lock_guard<std::mutex> lk(writeMutex_);
+        if (connected_) {
+            ws_.text(true);
+            ws_.async_write(
+                asio::buffer(s),
+                beast::bind_front_handler(&GateClient::onWrite, this));
+            onLog_("[SEND] " + s);
+        } else {
+            onLog_("Cannot send, not connected");
+        }
+    }
 
-            txSendMs = nowMs();
-            ws_ptr->write(net::buffer(boost::json::serialize(sendObj)));
-            std::cout << "[INFO] Отправили eth_sendTransaction, txSendMs = "
-                      << txSendMs << " ms\n";
+    // Базовый шаблон JSON: заполняем time, channel, event
+    json baseRequest(const std::string& channel, const std::string& event) {
+        json req;
+        uint64_t ts = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::system_clock::now().time_since_epoch()
+                      ).count();
+        req["time"]    = ts;
+        req["channel"] = channel;
+        req["event"]   = event;
+        return req;
+    }
+
+    // Замер RTT и лог
+    void logTime(const std::string& desc, std::chrono::high_resolution_clock::time_point t0) {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        std::ostringstream oss;
+        oss << "[" << desc << "] " << ms << " ms";
+        onLog_(oss.str());
+    }
+
+private:
+    asio::io_context&                                          ioc_;
+    ssl::context&                                              ssl_ctx_;
+    tcp::resolver                                              resolver_;
+
+    using ssl_stream_t = beast::ssl_stream<beast::tcp_stream>;
+    websocket::stream<ssl_stream_t>                            ws_;
+    beast::flat_buffer                                         buffer_;
+    std::thread                                                thread_;
+    std::mutex                                                 writeMutex_;
+    bool                                                       connected_   = false;
+    bool                                                       shouldClose_ = false;
+    std::string                                                host_;
+    std::string                                                port_;
+    std::string                                                apiKey_;
+    std::string                                                apiSecret_;
+    std::function<void(const std::string&)>                    onLog_;
+    std::mutex                                                 timeMutex_;
+    std::chrono::high_resolution_clock::time_point              loginStart_;
+    std::chrono::high_resolution_clock::time_point              orderStart_;
+};
+
+int main() {
+    // -------------------------------
+    // 1) Настройка Boost.Asio + SSL
+    // -------------------------------
+    asio::io_context ioc;
+    ssl::context    ssl_ctx(ssl::context::tlsv12_client);
+    ssl_ctx.set_verify_mode(ssl::verify_none);
+
+    // -------------------------------
+    // 2) Запрос API-ключей и хоста у пользователя
+    // -------------------------------
+    std::string host, port, apiKey, apiSecret;
+    std::cout << "Enter Gate.io WS host (e.g. fx-ws.gateio.ws): ";
+    std::getline(std::cin, host);
+    std::cout << "Enter port (e.g. 443): ";
+    std::getline(std::cin, port);
+    std::cout << "Enter API Key: ";
+    std::getline(std::cin, apiKey);
+    std::cout << "Enter API Secret: ";
+    std::getline(std::cin, apiSecret);
+
+    // -------------------------------
+    // 3) Создаём GateClient
+    // -------------------------------
+    GateClient client(ioc, ssl_ctx, host, port, apiKey, apiSecret);
+
+    // -------------------------------
+    // 4) Запускаем WebSocket-клиент в фоне с логированием в консоль
+    // -------------------------------
+    client.run([&](const std::string& line) {
+        std::lock_guard<std::mutex> lk(cout_mutex);
+        std::cout << line << std::endl;
+    });
+
+    // Даем секунду на подключение
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // -------------------------------
+    // 5) Консольное меню для пользователя
+    // -------------------------------
+    while (true) {
+        std::cout << "\nMenu:\n"
+                  << "1) Login\n"
+                  << "2) Place Order\n"
+                  << "3) Exit\n"
+                  << "Choose an option: ";
+        int choice;
+        if (!(std::cin >> choice)) {
+            std::cin.clear();
+            std::cin.ignore(10000, '\n');
+            continue;
         }
 
-        // Запускаем асинхронное чтение
-        auto buffer_ptr = std::make_shared<beast::flat_buffer>();
-        do_read(ws_ptr, buffer_ptr);
-        ioc.run();
+        if (choice == 1) {
+            client.sendLogin();
+        }
+        else if (choice == 2) {
+            std::string contract, price, tif, text;
+            int64_t size;
+            std::cout << "Contract (e.g. BTC_USDT): ";
+            std::cin >> contract;
+            std::cout << "Size (integer): ";
+            std::cin >> size;
+            std::cout << "Price (e.g. 30000.00): ";
+            std::cin >> price;
+            std::cout << "TIF (e.g. gtc): ";
+            std::cin >> tif;
+            std::cout << "Text field: ";
+            std::cin >> text;
+            client.sendPlaceOrder(contract, size, price, tif, text);
+        }
+        else if (choice == 3) {
+            break;
+        }
+        else {
+            std::cout << "Invalid option.\n";
+        }
     }
-    catch (std::exception const& e) {
-        std::cerr << "[FATAL] Exception: " << e.what() << "\n";
-        return EXIT_FAILURE;
-    }
-    return EXIT_SUCCESS;
+
+    // -------------------------------
+    // 6) Завершение работы
+    // -------------------------------
+    client.close();
+    return 0;
 }
